@@ -1,18 +1,3 @@
-Example payload
 ```
-{
-  "agent": {
-    "id": "{{ faker.random.uuid }}",
-    "skills": [
-      "aws-dynamo-db",
-      "linux",
-      "aws-lambda",
-      "database"
-    ],
-    "languages": [
-      "en",
-      "ch"
-    ]
-  }
-}
+curl -u guest:guest http://localhost:15672/api/exchanges/%2F | jq '.[] | select(.name | contains("routix"))'
 ```
