@@ -2,7 +2,7 @@ use routix_engine::{CoreEngine, models::case::CaseConfig};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-use crate::db::state::ApplicationState;
+use crate::app::state::ApplicationState;
 use crate::services::matcher::model::{Case, WorkRequest, WorkResponse, matcher_server::Matcher};
 
 type AppState = ApplicationState;
@@ -55,7 +55,7 @@ impl Matcher for Handler {
         let workflow_source = match self
             .state
             .policy_manager_client
-            .get_policy_data_decoded(department)
+            .get_policy_data_decoded(&department)
             .await
         {
             Ok(policy_data) => policy_data,
@@ -118,7 +118,7 @@ impl Handler {
         cases
             .iter()
             .filter(|c| c.score > score_threshold)
-            .map(|c| Case { id: c.id })
+            .map(|c| Case { id: c.id as u32 })
             .collect()
     }
 }
