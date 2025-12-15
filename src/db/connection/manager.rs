@@ -10,18 +10,6 @@ use bb8::ManageConnection;
 /// # Behavior
 /// - `create` establishes a new WebSocket connection to the SurrealDB server.
 /// - `recycle` sends a lightweight `"SELECT 1"` query to check if the connection is alive.
-///
-/// # Example
-/// ```rust
-/// use deadpool::managed::Pool;
-/// let manager = SurrealConnectionManager {
-///     endpoint: "localhost:8000".to_string(),
-///     namespace: "test".to_string(),
-///     database: "default".to_string(),
-/// };
-/// let pool = Pool::builder(manager).build().unwrap();
-/// let conn = pool.get().await?;
-/// ```
 pub struct SurrealConnectionManager {
     pub endpoint: String,
     pub database: String,
