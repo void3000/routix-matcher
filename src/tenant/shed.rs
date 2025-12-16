@@ -26,14 +26,48 @@ use tokio::{
     task::JoinHandle,
     sync::OnceCell,
     time::{
-        sleep,
+        interval,
         Duration
     }
 };
 use tokio_util::sync::CancellationToken;
 use lapin::Channel;
+use serde::{ Deserialize, Serialize };
 
+use crate::tenant::workflows::{
+    Workflow,
+    WorkflowType,
+    FetchSkillsWorkflow,
+    QueryNextAgentWorkflow,
+    ResolvePolicyWorkflow,
+    EvaluateMatchWorkflow,
+    RetrieveCandidateCasesWorkflow,
+    PushRecommendationWorkflow,
+    WorkflowContext,
+};
+use routix_engine::{CoreEngine, models::case::CaseConfig};
 use crate::tenant::rabbit_mq;
+use crate::app::state::ApplicationState;
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CaseSummary {
+    pub id: i32,
+    pub category: String,
+    pub status: String,
+    pub priority: i32,
+}
+
+impl From<&CaseConfig> for CaseSummary {
+    fn from(case: &CaseConfig) -> Self {
+        Self {
+            id: case.id,
+            category: case.category.clone(),
+            status: case.status.clone(),
+            priority: case.priority,
+        }
+    }
+}
 
 /// The Tenant Scheduler
 ///
@@ -80,10 +114,18 @@ impl TenantScheduler {
     /// Creates a new tenant scheduler, however it does not run it immediately.
     /// 
     /// # Example
-    /// 
+    ///
     /// ```ignore
-    /// use lapin::Channel;
-    /// Arc::new(TenantScheduler::new(1, "routix".to_string(), channel)).run();
+    /// use std::sync::Arc;
+    /// use tenant::shed::TenantScheduler;
+    /// 
+    /// Arc::new(
+    ///     TenantScheduler::new(
+    ///         13454365,
+    ///         "tenant".to_string(),
+    ///         "amqp://guest:guest@127.0.0.1:5672/%2f".to_string()
+    ///     )
+    /// ).run();
     /// ````
     pub fn new(
         tenant_id: u32, 
@@ -145,68 +187,80 @@ impl TenantScheduler {
     /// scheduler.clone().run();
     /// ```
     async fn scheduler_loop(&self) {
+        let mut ticker = interval(Duration::from_secs(1));
+
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
-                    info!("Shutting down tenant scheduler: {}", self.tenant_id);
-
-                    /// Tear down channel before exiting. This ensures that all resources
-                    /// are properly released and there are no dangling connections to
-                    /// the message broker.
                     self.tear_adown_channel().await;
                     break;
                 },
-                _ = sleep(Duration::from_millis(1000)) => {
-                    info!("Running tenant scheduler: {}", self.tenant_id);
-
-                    match self.poll().await {
-                        Ok(_) => info!("Successfully polled for cases"),
-                        Err(e) => error!("Error polling for cases: {}", e)
-                    };
+                _ = ticker.tick() => {
+                    self.tick().await;
                 }
             }
         }
     }
 
-    async fn poll(&self) -> Result<(), String> {
-        rabbit_mq::publish_case(
-            &self.exchange_name,
-            &self.channel.get()
-                .expect("Channel not initialized"),
-            format!("agent.{}", self.tenant_id).as_str(),
-            b"hello world!"
-        ).await;
+    async fn tick(&self) {
+        info!("Running tenant scheduler: {}", self.tenant_id);
 
-        Ok(())
+        let state = ApplicationState::global();
+        let workflows = vec![
+            WorkflowType::QueryNextAgent(QueryNextAgentWorkflow { 
+                repo: state.registry_repository.clone()
+            }),
+            WorkflowType::FetchSkills(FetchSkillsWorkflow { 
+                repo: state.agent_repository.clone() 
+            }),
+            WorkflowType::RetrieveCandidateCases(RetrieveCandidateCasesWorkflow { 
+                repo: state.case_repository.clone() 
+            }),
+            WorkflowType::ResolvePolicy(ResolvePolicyWorkflow { 
+                client: state.policy_manager_client.clone() 
+            }),
+            WorkflowType::EvaluateMatch(EvaluateMatchWorkflow {
+                engine: CoreEngine::new()
+            }),
+            WorkflowType::PushRecommendation(PushRecommendationWorkflow {
+                exchange_name: self.exchange_name.clone(),
+                channel: self.channel.clone()
+            }),
+        ];
+        
+        let _ = Workflow { steps: workflows }
+            .run(WorkflowContext::default())
+            .await
+            .map_err(|e| format!("workflow execution failed: {e}"));
     }
  
     async fn initialize_channel(&self) {
-        self.channel.get_or_init(
-            || async { 
-                let channel = rabbit_mq::create_channel(
-                        &self.mq_endpoint
-                    ).await;
+        self.channel.get_or_init(|| async { 
+            let channel: Channel =
+            rabbit_mq::create_channel(&self.mq_endpoint).await;
+            rabbit_mq::create_exchange(
+                &self.exchange_name,
+                &channel
+            ).await;
 
-                rabbit_mq::create_exchange(
-                    &self.exchange_name,
-                    &channel
-                ).await;
-
-                channel
-             }
-        ).await;
+            channel
+        }).await;
     }
 
     async fn tear_adown_channel(&self) {
-        self.channel.get().map(
-            |channel| async {
-                channel.close(200, "shutdown").await.ok();
+        if let Some(channel) = self.channel.get() {
+            if let Err(e) = channel.close(200, "shutdown").await {
+                error!("Failed to close channel: {:?}", e);
             }
-        );
+        }
     }
 
     #[allow(unused_must_use)]
     pub fn shutdown(&self) {
+        info!("Shutting down tenant scheduler: {}", self.tenant_id);
+        // Tear down channel before exiting. This ensures that all
+        // resources are properly released and there are no dangling
+        // connections to the message broker.
         self.shutdown.cancel();
     }
 }
@@ -220,24 +274,26 @@ mod tenant_scheduler {
         TenantScheduler,
         SchedulerHandle
     };
+    use crate::app::state::ApplicationState;
 
     #[tokio::test]
     async fn run_tenant_scheduler() {
+        #[allow(unused_must_use)]
+        ApplicationState::init().await;
+
         init_trace_logging();
 
         let mut handles: Vec<SchedulerHandle> = Vec::new();
 
         for tenant_id in 1..=3 {
             let scheduler =  Arc::new(
-                    TenantScheduler::new(
-                        tenant_id, 
-                        format!("routix.{}", tenant_id),
-                        "amqp://guest:guest@127.0.0.1:5672/%2f".to_string()
-                    )
-                );
-            let handler = scheduler
-                .clone()
-                .run();
+                TenantScheduler::new(
+                    tenant_id, 
+                    format!("routix.{}", tenant_id),
+                    "amqp://guest:guest@127.0.0.1:5672/%2f".to_string()
+                )
+            );
+            let handler = scheduler.clone().run();
 
             handles.push(handler);
         }

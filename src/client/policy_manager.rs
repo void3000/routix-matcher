@@ -5,7 +5,6 @@ use tokio::sync::Mutex;
 pub use routix_rust_clients::PolicyManagerClient;
 use routix_rust_clients::clients::policy_manager::proto::{GetPolicyRequest, GetPolicyResponse};
 
-// Create a wrapper type that works with Arc
 #[derive(Clone)]
 pub struct MatcherPolicyManagerClient {
     inner: Arc<Mutex<PolicyManagerClient>>,
@@ -31,10 +30,10 @@ impl MatcherPolicyManagerClient {
     /// Get policy data decoded (matcher-specific convenience method)
     pub async fn get_policy_data_decoded(
         &self,
-        department: String,
+        department: &str,
     ) -> Result<String, routix_rust_clients::ClientError> {
         let mut client = self.inner.lock().await;
-        let (_, decoded_data) = client.get_policy_decoded(department).await?;
+        let (_, decoded_data) = client.get_policy_decoded(department.to_string()).await?;
         Ok(decoded_data)
     }
 
